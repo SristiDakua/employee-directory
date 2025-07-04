@@ -1,7 +1,15 @@
 import { MongoClient, type Db, type Collection } from "mongodb"
 
+// Environment configuration with fallbacks
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017"
 const MONGODB_DB = process.env.MONGODB_DB || "employee_directory"
+
+// Validate environment variables
+if (!MONGODB_URI) {
+  throw new Error("MONGODB_URI environment variable is required")
+}
+
+console.log(`🔗 MongoDB Configuration: ${MONGODB_URI.includes('mongodb+srv://') ? 'Atlas Cloud' : 'Local'} -> ${MONGODB_DB}`)
 
 // Global declaration for connection tracking
 declare global {
@@ -13,37 +21,86 @@ let db: Db | null = null
 
 export async function connectToMongoDB(): Promise<Db> {
   if (db && client) {
-    // Reuse existing connection
-    return db
+    // Check if connection is still alive
+    try {
+      await client.db(MONGODB_DB).admin().ping()
+      return db
+    } catch (error) {
+      console.log("🔄 Existing connection lost, reconnecting...")
+      client = null
+      db = null
+    }
   }
 
-  try {
-    if (!client) {
-      client = new MongoClient(MONGODB_URI, {
-        maxPoolSize: 10,          // Maintain up to 10 socket connections
-        serverSelectionTimeoutMS: 5000, // Keep trying to send operations for 5 seconds
-        socketTimeoutMS: 45000,   // Close sockets after 45 seconds of inactivity
-        maxIdleTimeMS: 30000,     // Close connections after 30 seconds of inactivity
-      })
-      await client.connect()
-      console.log("✅ Connected to MongoDB with connection pooling")
-    }
-    
-    db = client.db(MONGODB_DB)
+  const maxRetries = 3
+  let retryCount = 0
 
-    // Only seed initial data once when first connecting
-    if (!global._mongoConnection) {
-      await seedInitialData()
-      global._mongoConnection = true
-    }
+  while (retryCount < maxRetries) {
+    try {
+      if (!client) {
+        // Determine connection options based on URI
+        const isAtlas = MONGODB_URI.includes('mongodb+srv://')
+        const connectionOptions: any = {
+          maxPoolSize: 10,
+          serverSelectionTimeoutMS: 15000,
+          socketTimeoutMS: 45000,
+          maxIdleTimeMS: 30000,
+          retryWrites: true,
+        }
 
-    return db
-  } catch (error) {
-    console.error("❌ MongoDB connection error:", error)
-    client = null
-    db = null
-    throw error
+        // Add Atlas-specific options
+        if (isAtlas) {
+          connectionOptions.ssl = true
+          connectionOptions.tls = true
+          connectionOptions.tlsAllowInvalidCertificates = false
+          connectionOptions.tlsAllowInvalidHostnames = false
+        }
+
+        client = new MongoClient(MONGODB_URI, connectionOptions)
+        await client.connect()
+        
+        // Test the connection
+        await client.db(MONGODB_DB).admin().ping()
+        console.log(`✅ Connected to MongoDB (${isAtlas ? 'Atlas' : 'Local'}) with connection pooling`)
+      }
+      
+      db = client.db(MONGODB_DB)
+
+      // Only seed initial data once when first connecting
+      if (!global._mongoConnection) {
+        await seedInitialData()
+        global._mongoConnection = true
+      }
+
+      return db
+    } catch (error) {
+      retryCount++
+      console.error(`❌ MongoDB connection attempt ${retryCount}/${maxRetries} failed:`, error instanceof Error ? error.message : error)
+      
+      if (client) {
+        try {
+          await client.close()
+        } catch (closeError) {
+          console.error("Error closing failed connection:", closeError)
+        }
+      }
+      
+      client = null
+      db = null
+
+      if (retryCount >= maxRetries) {
+        console.error("❌ All MongoDB connection attempts failed")
+        throw error
+      }
+
+      // Wait before retrying (exponential backoff)
+      const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 5000)
+      console.log(`⏳ Retrying connection in ${delay}ms...`)
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
   }
+
+  throw new Error("Failed to connect to MongoDB after all retry attempts")
 }
 
 async function createIndexes() {
@@ -203,16 +260,57 @@ async function seedInitialData() {
   }
 }
 
-export function getEmployeesCollection(): Collection {
-  if (!db) {
-    throw new Error("Database not connected")
+// Connection health check
+export async function checkMongoConnection(): Promise<boolean> {
+  try {
+    if (!client || !db) {
+      return false
+    }
+    await client.db(MONGODB_DB).admin().ping()
+    return true
+  } catch (error) {
+    console.error("MongoDB health check failed:", error)
+    return false
   }
-  return db.collection("employees")
 }
 
-export function getDepartmentsCollection(): Collection {
-  if (!db) {
-    throw new Error("Database not connected")
+// Graceful shutdown
+export async function closeMongoConnection(): Promise<void> {
+  try {
+    if (client) {
+      await client.close()
+      console.log("✅ MongoDB connection closed gracefully")
+    }
+  } catch (error) {
+    console.error("Error closing MongoDB connection:", error)
+  } finally {
+    client = null
+    db = null
+    global._mongoConnection = false
   }
-  return db.collection("departments")
+}
+
+// Handle process termination
+if (typeof process !== 'undefined') {
+  process.on('SIGINT', async () => {
+    console.log('🔄 Received SIGINT, closing MongoDB connection...')
+    await closeMongoConnection()
+    process.exit(0)
+  })
+
+  process.on('SIGTERM', async () => {
+    console.log('🔄 Received SIGTERM, closing MongoDB connection...')
+    await closeMongoConnection()
+    process.exit(0)
+  })
+}
+
+export async function getEmployeesCollection(): Promise<Collection> {
+  const database = await connectToMongoDB()
+  return database.collection("employees")
+}
+
+export async function getDepartmentsCollection(): Promise<Collection> {
+  const database = await connectToMongoDB()
+  return database.collection("departments")
 }
